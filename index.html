@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>NMS Mailer</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#1d2330;--mut:#5b6474;--ok:#1a7f37;--bad:#c62828;--line:#dde1e7;--acc:#1f5fbf;--in:#fff}
+@media (prefers-color-scheme:dark){:root{--bg:#14171c;--card:#1d2128;--fg:#e6e9ee;--mut:#9aa3b2;--ok:#4cc26b;--bad:#ff6b6b;--line:#2e343e;--acc:#6aa2ff;--in:#14171c}}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,"Segoe UI",sans-serif;margin:0;padding:16px}
+main{max-width:640px;margin:0 auto}
+h1{font-size:18px;margin:0 0 2px}.sub{color:var(--mut);font-size:13px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:12px 0}
+label{display:block;font-size:12px;color:var(--mut);margin:10px 0 3px}
+input,textarea{width:100%;font:inherit;color:var(--fg);background:var(--in);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+textarea{min-height:150px;resize:vertical}
+button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:9px 16px;font-size:14px;cursor:pointer}
+button.ghost{background:transparent;color:var(--acc);border:1px solid var(--line)}
+button:disabled{opacity:.55;cursor:default}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.sp{flex:1}
+.ok{color:var(--ok)}.bad{color:var(--bad)}
+.att{display:flex;gap:8px;padding:6px 0;border-top:1px solid var(--line);font-size:14px}.att:first-child{border-top:0}
+.diag div{display:flex;gap:10px;padding:4px 0;font-size:12px;border-top:1px solid var(--line)}.diag b{min-width:170px}.diag span{word-break:break-all}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<main>
+  <div class="row"><div class="sp"><h1>NMS Mailer</h1><div class="sub">Sends invoices and statements from your Microsoft 365 mailbox.</div></div></div>
+
+  <div class="card" id="acct"><div class="row"><div class="sp" id="acctText">Checking sign-in…</div><button id="bIn" hidden>Sign in with Microsoft</button><button id="bOut" class="ghost" hidden>Sign out</button></div></div>
+
+  <div class="card" id="wait"><div id="waitText">Waiting for the email from NMS Ledger…</div></div>
+
+  <form class="card" id="mail" hidden novalidate>
+    <label for="fTo">To</label><input id="fTo" autocomplete="off">
+    <label for="fCc">Cc</label><input id="fCc" autocomplete="off">
+    <label for="fSub">Subject</label><input id="fSub" autocomplete="off">
+    <label for="fBody">Message</label><textarea id="fBody"></textarea>
+    <label>Attachments</label><div id="atts"></div>
+    <div class="row" style="margin-top:14px"><div class="sp sub" id="status"></div><button type="button" class="ghost" id="bCancel">Cancel</button><button id="bSend">Send</button></div>
+  </form>
+
+  <div class="card" id="done" hidden><b class="ok" id="doneText"></b><div class="sub">This window will close by itself.</div></div>
+
+  <details class="card"><summary class="sub">Connection details</summary><div class="diag" id="diag"></div></details>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@3.27.0/lib/msal-browser.min.js"></script>
+<script src="config.js"></script>
+<script>
+(function () {
+  "use strict";
+  var CFG = window.NMS_MAILER_CONFIG || {};
+  var KEY = "nms-mailer-payload";
+  var SCOPES = ["Mail.Send", "User.Read"];
+  var MAX_BYTES = 3 * 1024 * 1024; // Graph sendMail limit for inline attachments
+  var $ = function (id) { return document.getElementById(id); };
+  var pca = null, account = null, job = null;
+
+  function diag(k, v, good) {
+    var d = document.createElement("div"); var b = document.createElement("b"); var s = document.createElement("span");
+    b.textContent = k; s.textContent = v; if (good !== undefined) s.className = good ? "ok" : "bad"; d.appendChild(b); d.appendChild(s); $("diag").appendChild(d);
+  }
+  function originOk(o) { return (CFG.allowedOrigins || []).some(function (p) { return new RegExp(p).test(o); }); }
+  function tell(msg) { try { if (window.opener && job && job.origin) window.opener.postMessage(msg, job.origin); } catch (e) {} }
+  function status(t, bad) { $("status").textContent = t; $("status").className = "sp sub" + (bad ? " bad" : ""); }
+  function fmtSize(n) { return n > 1048576 ? (n / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(n / 1024)) + " KB"; }
+  function b64len(s) { return Math.floor((s || "").length * 3 / 4); }
+  function addrs(s) { return (s || "").split(/[;,]/).map(function (x) { return x.trim(); }).filter(Boolean); }
+  function validEmail(a) { return /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(a); }
+
+  function save() { try { sessionStorage.setItem(KEY, JSON.stringify(job)); } catch (e) {} }
+  function load() { try { return JSON.parse(sessionStorage.getItem(KEY) || "null"); } catch (e) { return null; } }
+  function clear() { try { sessionStorage.removeItem(KEY); } catch (e) {} }
+
+  function showAccount() {
+    if (!CFG.clientId) { $("acctText").innerHTML = '<span class="bad">Not set up yet: the app registration (client ID) is missing.</span>'; return; }
+    if (account) { $("acctText").textContent = "Sending as " + account.username; $("bIn").hidden = true; $("bOut").hidden = false; }
+    else { $("acctText").textContent = "You are not signed in."; $("bIn").hidden = false; $("bOut").hidden = true; }
+  }
+
+  function render() {
+    if (!job) return;
+    var m = job.mail; $("wait").hidden = true; $("mail").hidden = false;
+    $("fTo").value = (m.to || []).join("; "); $("fCc").value = (m.cc || []).join("; ");
+    $("fSub").value = m.subject || ""; $("fBody").value = m.body || "";
+    var box = $("atts"); box.textContent = ""; var total = 0;
+    (m.attachments || []).forEach(function (a) { var n = b64len(a.contentBytes); total += n; var d = document.createElement("div"); d.className = "att"; var s1 = document.createElement("span"); s1.className = "sp"; s1.textContent = "📎 " + a.name; var s2 = document.createElement("span"); s2.className = "sub"; s2.textContent = fmtSize(n); d.appendChild(s1); d.appendChild(s2); box.appendChild(d); });
+    if (!(m.attachments || []).length) box.innerHTML = '<span class="sub">No attachments</span>';
+    if (total > MAX_BYTES) status("Attachments are larger than 3 MB: Microsoft will reject them.", true);
+  }
+
+  function accept(data, origin) {
+    var m = data.mail || {};
+    if (!Array.isArray(m.attachments)) m.attachments = [];
+    m.attachments = m.attachments.filter(function (a) { return a && typeof a.name === "string" && typeof a.contentBytes === "string"; })
+      .map(function (a) { return { name: a.name.slice(0, 200), contentType: a.contentType || "application/octet-stream", contentBytes: a.contentBytes }; });
+    job = { id: String(data.id || ""), origin: origin, mail: { to: (m.to || []).map(String), cc: (m.cc || []).map(String), subject: String(m.subject || ""), body: String(m.body || ""), attachments: m.attachments } };
+    save(); render(); tell({ type: "nms-mailer-got", id: job.id });
+  }
+
+  window.addEventListener("message", function (e) {
+    var d = e.data; if (!d || d.type !== "nms-mail") return;
+    if (!originOk(e.origin)) { diag("Rejected message from", e.origin, false); return; }
+    diag("Message from", e.origin, true); accept(d, e.origin);
+  });
+
+  async function token() {
+    var req = { scopes: SCOPES, account: account };
+    try { return (await pca.acquireTokenSilent(req)).accessToken; }
+    catch (e) { save(); await pca.acquireTokenRedirect({ scopes: SCOPES, loginHint: account && account.username }); return null; }
+  }
+
+  async function send(ev) {
+    ev.preventDefault(); if (!job) return;
+    if (!account) { save(); return pca.loginRedirect({ scopes: SCOPES }); }
+    var to = addrs($("fTo").value), cc = addrs($("fCc").value);
+    if (!to.length) return status("Add at least one recipient.", true);
+    var badA = to.concat(cc).filter(function (a) { return !validEmail(a); }); if (badA.length) return status("Check this address: " + badA[0], true);
+    job.mail.to = to; job.mail.cc = cc; job.mail.subject = $("fSub").value; job.mail.body = $("fBody").value; save();
+    $("bSend").disabled = true; status("Sending…");
+    try {
+      var t = await token(); if (!t) return;
+      var r = (function (l) { return l.map(function (a) { return { emailAddress: { address: a } }; }); });
+      var msg = { message: { subject: job.mail.subject, body: { contentType: "Text", content: job.mail.body }, toRecipients: r(to), ccRecipients: r(cc),
+        attachments: job.mail.attachments.map(function (a) { return { "@odata.type": "#microsoft.graph.fileAttachment", name: a.name, contentType: a.contentType, contentBytes: a.contentBytes }; }) }, saveToSentItems: true };
+      var res = await fetch("https://graph.microsoft.com/v1.0/me/sendMail", { method: "POST", headers: { Authorization: "Bearer " + t, "Content-Type": "application/json" }, body: JSON.stringify(msg) });
+      if (res.status !== 202) { var tx = await res.text(); throw new Error("Microsoft answered " + res.status + ": " + tx.slice(0, 300)); }
+      var sentAt = new Date().toISOString();
+      tell({ type: "nms-mail-sent", id: job.id, to: to, cc: cc, from: account.username, sentAt: sentAt });
+      clear(); $("mail").hidden = true; $("done").hidden = false; $("doneText").textContent = "Sent to " + to.join(", ") + ".";
+      setTimeout(function () { window.close(); }, 3000);
+    } catch (e) { $("bSend").disabled = false; status("Not sent: " + e.message, true); tell({ type: "nms-mail-error", id: job.id, error: String(e.message || e) }); }
+  }
+
+  $("mail").addEventListener("submit", send);
+  $("bCancel").onclick = function () { tell({ type: "nms-mail-cancelled", id: job && job.id }); clear(); window.close(); };
+  $("bIn").onclick = function () { save(); pca.loginRedirect({ scopes: SCOPES }); };
+  $("bOut").onclick = function () { pca.logoutRedirect({ account: account, postLogoutRedirectUri: location.origin + location.pathname }); };
+
+  (async function start() {
+    diag("Origin", location.origin);
+    diag("Opened by NMS Ledger", String(!!window.opener), !!window.opener);
+    var ls = "no"; try { localStorage.setItem("t", "1"); ls = localStorage.getItem("t") === "1" ? "yes" : "no"; localStorage.removeItem("t"); } catch (e) { ls = "blocked: " + e.name; } diag("Remembers sign-in (localStorage)", ls, ls === "yes");
+    diag("MSAL library", window.msal ? "loaded" : "missing", !!window.msal);
+    try { var rr = await fetch("https://login.microsoftonline.com/common/discovery/instance?api-version=1.1&authorization_endpoint=https://login.microsoftonline.com/common/oauth2/v2.0/authorize"); diag("Reach Microsoft", "HTTP " + rr.status, rr.ok); } catch (e) { diag("Reach Microsoft", "BLOCKED: " + e.message, false); }
+
+    job = load(); if (job) render();
+    if (CFG.clientId && window.msal) {
+      pca = new msal.PublicClientApplication({ auth: { clientId: CFG.clientId, authority: "https://login.microsoftonline.com/" + CFG.tenantId, redirectUri: location.origin + location.pathname, navigateToLoginRequestUrl: false }, cache: { cacheLocation: "localStorage" } });
+      await pca.initialize();
+      try { var res = await pca.handleRedirectPromise(); if (res && res.account) pca.setActiveAccount(res.account); } catch (e) { diag("Sign-in error", e.message, false); }
+      account = pca.getActiveAccount() || pca.getAllAccounts()[0] || null; if (account) pca.setActiveAccount(account);
+    }
+    showAccount();
+    if (window.opener) { try { window.opener.postMessage({ type: "nms-mailer-ready" }, "*"); } catch (e) {} }
+    else if (!job) $("waitText").textContent = "Open this window from NMS Ledger (Send) to email an invoice or statement.";
+  })();
+})();
+</script>
+</body>
+</html>
